@@ -1,0 +1,24 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+node_modules
+
+# raycast
+raycast-env.d.ts
+.raycast-swift-build
+.swiftpm
+compiled
+dist
+*.dSYM.zip
+
+# misc
+.DS_Store
+*.log
+
+# editor
+.vscode
+.idea
+
+# env
+.env
+.env.local

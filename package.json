@@ -1,0 +1,55 @@
+{
+  "$schema": "https://www.raycast.com/schemas/extension.json",
+  "name": "meme-search",
+  "title": "表情包搜索",
+  "description": "本地 AI 打标的表情包搜索与一键复制",
+  "icon": "extension-icon.png",
+  "author": "guoqu",
+  "categories": ["Productivity"],
+  "license": "MIT",
+  "commands": [
+    {
+      "name": "search-memes",
+      "title": "搜索表情包",
+      "subtitle": "Meme Search",
+      "description": "按标签/文字/情绪搜索本地表情包，回车复制到剪贴板",
+      "mode": "view"
+    }
+  ],
+  "preferences": [
+    {
+      "name": "memeDir",
+      "type": "directory",
+      "required": true,
+      "title": "表情包目录",
+      "description": "包含 index.json 和对应图片的文件夹绝对路径"
+    },
+    {
+      "name": "columns",
+      "type": "textfield",
+      "required": false,
+      "default": "5",
+      "title": "Grid 列数",
+      "description": "Grid 视图一行显示多少张表情（3-8 合适）"
+    }
+  ],
+  "dependencies": {
+    "@raycast/api": "^1.88.0",
+    "@raycast/utils": "^1.18.0",
+    "react": "^18.3.1"
+  },
+  "devDependencies": {
+    "@raycast/eslint-config": "^1.0.11",
+    "@types/node": "^22.10.0",
+    "@types/react": "^18.3.12",
+    "eslint": "^8.57.0",
+    "prettier": "^3.2.5",
+    "typescript": "^5.6.3"
+  },
+  "scripts": {
+    "build": "ray build",
+    "dev": "ray develop",
+    "fix-lint": "ray lint --fix",
+    "lint": "ray lint"
+  }
+}
