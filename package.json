@@ -58,6 +58,7 @@
     "dev": "ray develop",
     "fix-lint": "ray lint --fix",
     "lint": "ray lint",
-    "tag": "tsx scripts/tag.ts"
+    "tag": "tsx scripts/tag.ts",
+    "cleanup-watermarks": "tsx scripts/cleanup-watermarks.ts"
   }
 }
