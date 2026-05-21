@@ -23,6 +23,13 @@ import Anthropic from "@anthropic-ai/sdk";
 import pLimit from "p-limit";
 import sharp from "sharp";
 
+import {
+  SYSTEM_PROMPT,
+  buildUserPrompt,
+  buildBatchPrompt,
+  buildGeminiPrompt,
+} from "./prompts";
+
 const execFileAsync = promisify(execFile);
 
 // ---------------- 类型 ----------------
@@ -159,8 +166,31 @@ function makeTmpPath(suffix: string): string {
 }
 
 /**
- * GIF → 抽 9 帧拼 3x3 宫格 PNG（每帧 500x500，输出 1500x1500）。
- * 单帧无法解决"字幕在中间帧"问题，宫格保证字幕帧基本都被覆盖。
+ * 从 ffmpeg 的 stderr 里解析出 gif 时长（秒）。失败 fallback 到 2.5。
+ * 用 `ffmpeg -i input.gif` 即可（无 ffprobe 依赖）；ffmpeg 会因为没有 output 报错退出，
+ * 但 stderr 里有 "Duration: HH:MM:SS.MS"。
+ */
+async function getGifDuration(absPath: string): Promise<number> {
+  try {
+    await execFileAsync("ffmpeg", ["-i", absPath]);
+  } catch (e: unknown) {
+    const stderr = String((e as { stderr?: Buffer }).stderr ?? "");
+    const m = stderr.match(/Duration:\s*(\d+):(\d+):([\d.]+)/);
+    if (m) {
+      return parseInt(m[1], 10) * 3600 + parseInt(m[2], 10) * 60 + parseFloat(m[3]);
+    }
+  }
+  return 2.5; // fallback
+}
+
+/**
+ * GIF → 抽 16 帧拼 4x4 宫格 PNG（每帧 400x400，输出 1600x1600）。
+ *
+ * 设计要点（2026-05-21 benchmark 之后调整）：
+ * - 4x4 vs 3x3：多看 7 帧让 Claude 抓到更完整时序，#3 这种"前几帧像愤怒、整段是无奈"
+ *   的 case 能改对（详见 docs/decision-log/2026-05-21-meme-tagging-pipeline.md）。
+ * - 均匀采样：用 ffmpeg 的 fps 滤镜 = 16/duration，覆盖整段时间线（旧版 mod(n,3) 偏前）。
+ *
  * 非 GIF 直接转 PNG。
  * 返回临时 PNG 路径 + cleanup 函数。
  */
@@ -173,13 +203,16 @@ async function prepareGridImage(
     await fs.unlink(tmpPath).catch(() => {});
   };
   if (ext === ".gif") {
-    // 抽帧 + 拼图：每隔 3 帧选一帧，缩到 500x500（letterbox），拼 3x3
+    const duration = await getGifDuration(absPath);
+    // 16 / duration = 目标采样 fps。clamp 到 [1, 30] 防极端值。
+    const targetFps = Math.max(1, Math.min(30, 16 / Math.max(duration, 0.4)));
+    const fpsStr = targetFps.toFixed(4);
     await execFileAsync("ffmpeg", [
       "-y",
       "-i",
       absPath,
       "-vf",
-      "select='not(mod(n,3))',scale=500:500:force_original_aspect_ratio=decrease,pad=500:500:(ow-iw)/2:(oh-ih)/2,tile=3x3",
+      `fps=${fpsStr},scale=400:400:force_original_aspect_ratio=decrease,pad=400:400:(ow-iw)/2:(oh-ih)/2,tile=4x4`,
       "-frames:v",
       "1",
       tmpPath,
@@ -257,25 +290,7 @@ function hamming(a: string, b: string): number {
 }
 
 // ---------------- Claude 调用 ----------------
-
-const SYSTEM_PROMPT = `你是一个表情包打标助手。用户会给你一张表情包图片（如果原图是 GIF，已抽取最有代表性的一帧）。
-
-严格按以下 JSON schema 输出（只输出 JSON 本体，不要 markdown 代码块、不要前言、不要解释）：
-
-{
-  "description": string,          // 一句话客观描述图片内容（人物、动作、场景），不超过 30 字
-  "tags": string[],               // 8-20 个搜索关键词，中文，多角度覆盖
-  "emotion": string,              // 主要情绪，中文单词，例如：开心 / 阴阳 / 委屈 / 愤怒 / 无奈 / 鼓励 / 中性 / 困惑 / 害羞
-  "has_text": boolean,            // 图片上是否有可见文字
-  "text_content": string | null   // 图片上所有可见文字，逐字识别；多句之间用空格分隔；无文字则 null
-}
-
-要求（极其重要）:
-1. text_content 必须把图片上能看到的每一个汉字都识别进去，包括字幕、对话框、表情包标语、台词等。一字不漏。即使文字很小或不清晰，也要尽力识别。
-2. 如果有文字，把文字按句拆开后也加进 tags（例如文字是"我等你回来"，则 tags 应包含"我等你回来"、"等你回来"、"等你"、"等待"等），让用户搜句子片段也能命中。
-3. tags 要覆盖：场景、情绪、动作、人物特征、可能的使用场景、角色名（如果认识）。每个 tag 是单独的中文短语，不要带标点。
-4. emotion 必须是中文词，不要用英文 joy/sad/anger。
-5. 输出必须是合法 JSON，仅 JSON，无其他字符。`;
+// Prompts 在 ./prompts.ts，import 在文件顶部。
 
 interface TagResult {
   description: string;
@@ -339,35 +354,6 @@ function normalizeTag(raw: unknown): TagResult {
     has_text: Boolean(p.has_text),
     text_content: p.text_content ? String(p.text_content) : null,
   };
-}
-
-function buildUserPrompt(gridPath: string, isGifGrid: boolean): string {
-  const intro = isGifGrid
-    ? `请用 Read 工具读取图片：${gridPath}
-
-注意：这是一张 GIF 动图按时间顺序抽 9 帧拼成的 3×3 宫格（左上→右下是时间序列）。请把它当作"同一个表情包的不同时刻"来理解，**不是 9 个不同的表情包**。字幕可能只在中间某几格出现。`
-    : `请用 Read 工具读取图片：${gridPath}`;
-
-  return `${intro}
-
-严格按以下 XML 格式输出 5 个字段（每个标签必须出现），不要输出标签之外的任何文字：
-
-<description>一句话描述图片（人物/动作/场景），不超过 30 字</description>
-<emotion>中文情绪词：开心 / 阴阳 / 委屈 / 愤怒 / 无奈 / 鼓励 / 中性 / 困惑 / 害羞 / 难过 等</emotion>
-<has_text>true 或 false（小写）</has_text>
-<text_content>图上所有文字逐字识别，多句用空格分隔；无文字时写 NONE</text_content>
-<tags>
-- tag1
-- tag2
-（共 8-20 个，每行一个，前面带 "- "）
-</tags>
-
-要求（极其重要）:
-1. text_content 必须把图上能看到的每一个汉字都识别进去（字幕/对话框/标语/台词），一字不漏。${isGifGrid ? "宫格里 9 个时刻出现过的所有文字都要识别。" : ""}
-2. 如果有文字，按句拆开后也加进 tags（例如"我等你回来" → tags 含"我等你回来"、"等你回来"、"等你"、"等待"）。
-3. tags 覆盖：场景、情绪、动作、人物特征、可能的使用场景、角色名。每个 tag 是中文短语，不带标点。
-4. emotion 必须是中文词，不要用英文。
-5. ${isGifGrid ? "description 是描述整个表情包（一个时刻或动作），不要写成 9 张图各自描述。" : ""}`;
 }
 
 function makeAnthropicSdkProvider(model: string, apiKey: string): TagProvider {
@@ -464,31 +450,6 @@ function makeClaudeCliProvider(model: string): TagProvider {
   };
 }
 
-function buildGeminiPrompt(absPath: string): string {
-  return `请分析这张表情包图片：${absPath}
-
-**关键**：如果是 GIF 动图，请看完所有帧（字幕可能在不同帧出现）。
-
-严格按以下 XML 格式输出 5 个字段（每个标签必须出现），不要输出标签之外的任何文字：
-
-<description>一句话描述图片（人物/动作/场景），不超过 30 字</description>
-<emotion>中文情绪词：开心 / 阴阳 / 委屈 / 愤怒 / 无奈 / 鼓励 / 中性 / 困惑 / 害羞 / 难过 等</emotion>
-<has_text>true 或 false（小写）</has_text>
-<text_content>图上所有文字逐字识别，多句用空格分隔；无文字时写 NONE</text_content>
-<tags>
-- tag1
-- tag2
-（共 8-20 个，每行一个，前面带 "- "）
-</tags>
-
-要求（极其重要）:
-1. text_content 必须把图上能看到的每一个汉字都识别进去（字幕/对话框/标语/台词），一字不漏。GIF 动图里所有帧出现过的文字都要识别。
-2. 如果有文字，按句拆开后也加进 tags（例如"我等你回来" → tags 含"我等你回来"、"等你回来"、"等你"、"等待"）。
-3. tags 覆盖：场景、情绪、动作、人物特征、可能的使用场景、角色名。每个 tag 是中文短语，不带标点。
-4. emotion 必须是中文词，不要用英文。
-5. 标签内可以自由使用中文符号，无需转义任何字符。`;
-}
-
 function makeGeminiCliProvider(model: string | null): TagProvider {
   return {
     name: `gemini CLI${model ? ` (${model})` : " (default)"}`,
@@ -542,42 +503,6 @@ function pickProvider(provider: string, model: string): TagProvider {
 }
 
 // ---------------- 批量打标（一个 claude session 跑多张图）----------------
-
-function buildBatchPrompt(gridPaths: string[]): string {
-  const n = gridPaths.length;
-  const list = gridPaths.map((p, i) => `${i + 1}. ${p}`).join("\n");
-  return `请用 Read 工具依次读取下列 ${n} 张图片，对每张图输出一个 XML 块。
-
-**关键**：每张图都是一个 GIF 动图按时间顺序抽 9 帧拼成的 3×3 宫格（左上→右下是时间序列）。要把每张拼图当作"同一个表情包的不同时刻"理解，不是 9 个不同表情包。字幕可能只在中间某几格出现，要把所有出现过的文字都识别进 text_content。
-
-图片清单（请严格按编号顺序处理）:
-${list}
-
-输出 ${n} 个 <image> 块，每张图一个块，格式严格如下：
-
-<image>
-<idx>1</idx>
-<description>一句话描述这个表情包（整体动作/场景，不是描述 9 张图），≤30字</description>
-<emotion>中文情绪词（开心 / 阴阳 / 委屈 / 愤怒 / 无奈 / 鼓励 / 中性 / 困惑 / 害羞 / 难过 等）</emotion>
-<has_text>true 或 false</has_text>
-<text_content>图上所有文字逐字识别（宫格 9 格出现过的所有字），多句用空格分隔；无文字写 NONE</text_content>
-<tags>
-- tag1
-- tag2
-（8-20 个，每行一个，前面 "- "）
-</tags>
-</image>
-
-要求（极其重要）:
-1. 必须输出 ${n} 个 <image> 块，每张图一个，按编号 1 到 ${n} 顺序，不能漏。
-2. <idx> 必须填对应编号（1 到 ${n}）。
-3. text_content 把图上每个汉字都识别进去，一字不漏。宫格里 9 个时刻出现过的所有字都要识别（字幕可能只在中间几帧）。
-4. 如果有文字，按句拆开后也加进 tags（"我等你回来" → "等你回来"、"等你"、"等待"）。
-5. tags 覆盖：场景、情绪、动作、人物、使用场景、角色名。中文短语，不带标点。
-6. emotion 用中文词，不要英文。
-7. 仅输出 XML 块。不要任何前言、后语、解释、markdown 标记。
-8. description 写整张表情包的描述，不要写成"9 张图各自描述"。即使到第 ${n} 张也要认真。`;
-}
 
 async function tagBatchViaClaudeCli(
   absPaths: string[],

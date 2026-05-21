@@ -25,3 +25,7 @@ dist
 
 # 表情包素材（本地资源库，不入库）
 memes/
+
+# 本地工具状态（Claude Code worktrees、agy CLI 本地配置等）
+.claude/
+.antigravitycli/
