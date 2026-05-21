@@ -49,11 +49,30 @@ npm run tag -- --help
 - 没有 → spawn `claude` CLI（合规复用 Claude Max 配额；25 秒/张，慢但免费）。
 
 **关键设计**:
+- GIF 抽帧策略：**16 帧 4×4 拼图**（按 `fps = 16/duration` 均匀采样覆盖整段时间线）。详见 [scripts/tag.ts:prepareGridImage](scripts/tag.ts)。2026-05-21 从 9 帧 3×3 升级，对动作复杂的 gif 时序判断改善明显（实验记录见 memory）。
 - Claude 输出**强制 XML 格式**而非 JSON —— 因为模型在 JSON 字符串里嵌引号时常常忘转义，导致 `JSON.parse` 失败。XML 没这个问题。
 - 进程内 `pLimit` 控制并发；每 10 张或 5 秒落盘一次；`SIGINT`/`SIGTERM` 也会先落盘再退出。
 - 不要并行起多个 `npm run tag`，**会互相覆盖 index.json**。要并发就用 `--concurrency`。
 
-**Prompt 强约束 OCR**：[scripts/tag.ts:buildUserPrompt](scripts/tag.ts) 明确要求逐字识别图上文字，把文字按句拆开后塞进 tags 让搜句子片段也能命中。
+**Prompts 都在 [scripts/prompts.ts](scripts/prompts.ts)**（单独模块，集中维护设计原则）。三大约束：
+1. 字幕逐字识别 + 按句拆进 tags（搜句子片段也命中）；
+2. **忽略系列水印**（如 "Na" / "月巴" / "ANG" 这种角落非语义小水印不入 text/tags），避免污染搜索；
+3. tags 至少 6 个意图/情绪类抽象词（嫌弃/傲娇/敷衍/阴阳怪气 等），不只描述外观和动作。
+
+改 prompt 只动 prompts.ts；tag.ts 是业务逻辑（抽帧、调 provider、并发、落盘），跟 prompt 设计正交。
+
+## 数据清洗：水印污染
+
+某些表情包系列在角落带固定水印（如印尼小胖 tantan 的 "月巴" / "Na" / "ANG"）。如果之前用旧版 prompt 打过的 index 有水印污染（"月巴" 入了 tags 等），跑这个清掉：
+
+```bash
+npm run cleanup-watermarks                         # dry-run（默认）
+npm run cleanup-watermarks -- --write              # 实际写回，自动备份 index.json.bak.<ts>
+npm run cleanup-watermarks -- --dir <path>         # 指定 memeDir
+npm run cleanup-watermarks -- --add "新水印词"      # 追加要清的水印（可重复）
+```
+
+已知水印词维护在 [scripts/cleanup-watermarks.ts:KNOWN_WATERMARKS](scripts/cleanup-watermarks.ts)。发现新水印时直接加到这个数组。
 
 ## 开发命令
 
